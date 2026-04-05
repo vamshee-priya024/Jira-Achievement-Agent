@@ -1,60 +1,16 @@
 # src/summarizer.py
-#
-# This module takes raw parsed Jira tickets and turns them into
-# human-readable achievement summaries using the Gemini API.
-#
-# DESIGN PRINCIPLE: This module knows NOTHING about Jira.
-# It only knows: "given a list of ticket dicts, return summaries."
-# That clean boundary means you could swap Gemini for any other
-# LLM later by only changing this file.
 
 import os
 import json
+import time
 import requests
 
-
-# ─────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────
-
-GEMINI_MODEL = "gemini-2.0-flash"
-
-# Gemini's REST endpoint — the API key goes in the URL as a query param,
-# not in the headers like Claude or OpenAI do.
-# We build the full URL at call time once we have the key from .env.
-GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models"
-    "/{model}:generateContent?key={api_key}"
-)
-
-# We categorize every ticket into one of these themes.
-# This lets us group achievements in the final report.
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 THEMES = ["Feature Delivery", "Bug Fix", "Infrastructure", "Collaboration", "Tech Debt", "Other"]
 
 
-# ─────────────────────────────────────────────
-# PROMPT BUILDER
-# ─────────────────────────────────────────────
-
 def build_prompt(tickets: list[dict]) -> str:
-    """
-    Converts a list of ticket dicts into a structured prompt string.
-
-    WHY A SEPARATE FUNCTION?
-    Prompt construction is logic, not just a string.
-    It deserves its own function so you can:
-    - Unit test it independently
-    - Tweak the prompt without touching API call logic
-    - See clearly what you're sending to the model
-
-    PROMPT ENGINEERING PRINCIPLES USED HERE:
-    1. Give the model a clear ROLE ("You are an expert...")
-    2. Show the exact INPUT FORMAT with real field names
-    3. Define the exact OUTPUT FORMAT — JSON schema with field names & types
-    4. Provide RULES to constrain behavior (no fluff, active voice, etc.)
-    5. Inject the actual DATA at the end, clearly delimited
-    """
-
     ticket_data = []
     for t in tickets:
         ticket_data.append({
@@ -66,9 +22,7 @@ def build_prompt(tickets: list[dict]) -> str:
             "story_points": t["story_points"],
             "labels":       t["labels"],
         })
-
     tickets_json = json.dumps(ticket_data, indent=2)
-
     return f"""You are an expert technical writer helping a software engineer document their weekly work achievements for performance reviews.
 
 Your job: Transform raw Jira ticket data into clear, professional achievement summaries.
@@ -88,8 +42,7 @@ Each element must have exactly these fields:
 ## Rules
 - Use active voice: "Delivered X" not "X was delivered"
 - Start brag_bullet with a strong verb: Resolved, Delivered, Architected, Reduced, Improved, Led, Shipped, Automated, Refactored
-- Infer impact from: priority (High/Highest = higher impact), story_points (more points = more complexity), issue type (Bug in prod = high impact)
-- If description is empty, infer context from the summary
+- Infer impact from: priority (High/Highest = higher impact), story_points (more points = more complexity), issue type (Bug = high impact)
 - theme must be exactly one of the values listed above
 - impact_level: high = priority Highest/High or points >= 5 | low = points <= 1 | medium = everything else
 - Return ONLY the JSON array. Nothing else.
@@ -98,154 +51,137 @@ Each element must have exactly these fields:
 {tickets_json}"""
 
 
-# ─────────────────────────────────────────────
-# API CALLER
-# ─────────────────────────────────────────────
-
-def call_gemini(prompt: str) -> str:
+def call_claude(prompt: str) -> tuple[str, int, int]:
     """
-    Sends a prompt to the Gemini API and returns the raw text response.
+    Calls Claude API and returns (response_text, input_tokens, output_tokens).
 
-    HOW GEMINI DIFFERS FROM CLAUDE:
-    ┌─────────────┬──────────────────────────────┬──────────────────────────────┐
-    │             │ Claude                       │ Gemini                       │
-    ├─────────────┼──────────────────────────────┼──────────────────────────────┤
-    │ Auth        │ x-api-key header             │ ?key= query param in URL     │
-    │ Body shape  │ {"messages": [...]}          │ {"contents": [...]}          │
-    │ Role name   │ "user"                       │ "user" (same)                │
-    │ Text field  │ content (string)             │ parts: [{text: ...}]         │
-    │ Response    │ data.content[0].text         │ data.candidates[0]           │
-    │             │                              │   .content.parts[0].text     │
-    └─────────────┴──────────────────────────────┴──────────────────────────────┘
-
-    Everything else — prompt design, JSON parsing, merging — stays identical.
-    That's the payoff of keeping the API caller isolated in its own function.
+    WHY RETURN TOKEN COUNTS?
+    The API response includes exact token usage in data["usage"].
+    We return these alongside the text so the caller can record
+    actual usage in the budget tracker — more accurate than estimates.
     """
-    api_key = os.environ.get("GEMINI_API_KEY", "")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        raise ValueError(
-            "Missing GEMINI_API_KEY in .env\n"
-            "Get a free key at: https://aistudio.google.com/apikey"
-        )
+        raise ValueError("Missing ANTHROPIC_API_KEY in .env — get yours at https://console.anthropic.com")
 
-    url = GEMINI_API_URL.format(model=GEMINI_MODEL, api_key=api_key)
-
-    # Gemini request body shape:
-    # "contents" is the conversation — each turn has a "role" and "parts"
-    # "parts" is a list because a single message can have text + images + files
-    # For our use case it's always just one text part
+    headers = {
+        "Content-Type":      "application/json",
+        "x-api-key":         api_key,
+        "anthropic-version": "2023-06-01"
+    }
     body = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,       # low temp = more deterministic, better for structured JSON
-            "maxOutputTokens": 2000,  # enough for ~20 ticket summaries
-        }
+        "model":      CLAUDE_MODEL,
+        "max_tokens": 1000,
+        "messages":   [{"role": "user", "content": prompt}]
     }
 
-    import time
     MAX_RETRIES = 4
-    wait        = 5  # start at 5s, doubles each retry
+    wait        = 5
 
     for attempt in range(1, MAX_RETRIES + 1):
-        print(f"   🧠 Calling Gemini API (attempt {attempt}/{MAX_RETRIES})...")
-
-        response = requests.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            json=body
-        )
+        print(f"   🧠 Calling Claude API (attempt {attempt}/{MAX_RETRIES})...")
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=body)
 
         if response.status_code == 429:
             if attempt == MAX_RETRIES:
-                raise RuntimeError(
-                    f"Gemini rate limit hit after {MAX_RETRIES} attempts. "
-                    f"Wait a minute and try again."
-                )
-            print(f"   ⏳ Rate limited (429). Waiting {wait}s before retry...")
+                raise RuntimeError("Rate limited after 4 attempts. Wait a minute and retry.")
+            print(f"   ⏳ Rate limited. Waiting {wait}s...")
             time.sleep(wait)
-            wait *= 2   # exponential backoff: 5 → 10 → 20 → 40s
+            wait *= 2
             continue
 
-        response.raise_for_status()
+        if response.status_code == 401:
+            raise ValueError("Invalid API key — check ANTHROPIC_API_KEY in your .env")
 
+        response.raise_for_status()
         data = response.json()
 
-        try:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError) as e:
-            raise ValueError(f"Unexpected Gemini response shape: {data}") from e
+        # Claude returns exact token usage in every response
+        # data["usage"] = {"input_tokens": 312, "output_tokens": 148}
+        input_tokens  = data.get("usage", {}).get("input_tokens",  0)
+        output_tokens = data.get("usage", {}).get("output_tokens", 0)
+        text          = data["content"][0]["text"]
 
+        return text, input_tokens, output_tokens
 
-# ─────────────────────────────────────────────
-# RESPONSE PARSER
-# ─────────────────────────────────────────────
 
 def parse_summaries(raw_response: str) -> list[dict]:
-    """
-    Parses the JSON array returned by Gemini.
-
-    WHY DEFENSIVE PARSING?
-    Even with a strict prompt, LLMs occasionally wrap output in
-    markdown fences (```json ... ```) or add a brief intro sentence.
-    We strip those defensively before parsing.
-    """
     text = raw_response.strip()
-
-    # Strip markdown code fences if present (```json ... ``` or ``` ... ```)
     if text.startswith("```"):
         lines = text.split("\n")
-        text = "\n".join(lines[1:-1]).strip()
-
+        text  = "\n".join(lines[1:-1]).strip()
     try:
         summaries = json.loads(text)
         if not isinstance(summaries, list):
-            raise ValueError("Expected a JSON array, got something else")
+            raise ValueError("Expected a JSON array")
         return summaries
     except json.JSONDecodeError as e:
-        print(f"⚠️  Failed to parse Gemini response as JSON: {e}")
-        print(f"   Raw response was:\n{raw_response[:500]}")
+        print(f"⚠️  Failed to parse response as JSON: {e}")
+        print(f"   Raw response:\n{raw_response[:500]}")
         return []
 
 
-# ─────────────────────────────────────────────
-# PUBLIC INTERFACE
-# ─────────────────────────────────────────────
-
 def summarize_tickets(tickets: list[dict]) -> list[dict]:
     """
-    Replaces the old batch version. Processes one ticket at a time
-    with a delay between calls to stay within Gemini free tier limits.
-
-    WHY ONE TICKET AT A TIME?
-    Gemini free tier allows ~15 RPM (requests per minute).
-    Sending all 8 tickets in one large prompt hits that limit hard.
-    Processing individually with a 4s gap keeps us at ~15 RPM safely.
-    Bonus: if one ticket fails, the rest still succeed.
-    This is called "chunked processing".
+    Processes one ticket at a time.
+    Checks token budget BEFORE each call, records actual usage AFTER.
+    Skips tickets that would exceed the weekly budget.
     """
-    import time
+    # Import here to avoid circular imports
+    from rate_limiter import check_budget, record_usage, estimate_call_cost
 
     if not tickets:
         print("   No tickets to summarize.")
         return []
 
-    print(f"\n📝 Summarizing {len(tickets)} tickets one at a time (free tier safe)...")
+    print(f"\n📝 Summarizing {len(tickets)} tickets with Claude Haiku...")
 
     enriched = []
+    skipped  = 0
+
     for i, ticket in enumerate(tickets, 1):
-        summary_text = ticket['summary'][:50]
-        print(f"   [{i}/{len(tickets)}] {ticket['key']}: {summary_text}...")
+        print(f"\n   [{i}/{len(tickets)}] {ticket['key']}: {ticket['summary'][:50]}...")
 
-        prompt    = build_prompt([ticket])   # one ticket per call
-        raw       = call_gemini(prompt)
+        prompt = build_prompt([ticket])
+
+        # ── Budget check BEFORE calling ──────────────────────
+        # This is the safety valve — if we'd exceed the weekly
+        # budget, we skip this ticket rather than making the call.
+        budget = check_budget(prompt, ticket_key=ticket["key"])
+
+        if not budget["allowed"]:
+            print(f"   ⛔ Skipping — budget exceeded:")
+            print(f"      {budget['reason']}")
+            skipped += 1
+            # Still append the ticket, just without AI summary
+            enriched.append({
+                **ticket,
+                "achievement":  "",
+                "theme":        "Other",
+                "impact_level": "medium",
+                "brag_bullet":  "",
+            })
+            continue
+
+        est = budget["estimate"]
+        print(f"   📊 Estimated: ~{est['input_tokens']} input + ~{est['output_tokens']} output tokens (${est['estimated_cost']:.4f})")
+
+        # ── Make the API call ─────────────────────────────────
+        raw, actual_input, actual_output = call_claude(prompt)
+
+        # ── Record ACTUAL usage after the call ───────────────
+        # Claude returns exact counts — more accurate than estimates
+        from rate_limiter import HAIKU_INPUT_COST_PER_M, HAIKU_OUTPUT_COST_PER_M
+        actual_cost = (
+            (actual_input  / 1_000_000) * HAIKU_INPUT_COST_PER_M +
+            (actual_output / 1_000_000) * HAIKU_OUTPUT_COST_PER_M
+        )
+        record_usage(ticket["key"], actual_input, actual_output, actual_cost)
+        print(f"   ✅ Actual: {actual_input} input + {actual_output} output tokens (${actual_cost:.4f})")
+
         summaries = parse_summaries(raw)
+        summary   = summaries[0] if summaries else {}
 
-        summary = summaries[0] if summaries else {}
         enriched.append({
             **ticket,
             "achievement":  summary.get("achievement", ""),
@@ -254,10 +190,11 @@ def summarize_tickets(tickets: list[dict]) -> list[dict]:
             "brag_bullet":  summary.get("brag_bullet", ""),
         })
 
-        # 4s gap between calls → ~15 RPM, safely under free tier cap.
-        # Skip the wait after the last ticket.
         if i < len(tickets):
-            time.sleep(4)
+            time.sleep(2)
 
-    print(f"   ✅ Summarized {len(enriched)} tickets")
+    if skipped:
+        print(f"\n   ⚠️  {skipped} ticket(s) skipped due to budget limits")
+
+    print(f"\n   ✅ Summarized {len(enriched) - skipped}/{len(tickets)} tickets")
     return enriched
